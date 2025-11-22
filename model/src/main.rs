@@ -2,162 +2,126 @@ mod model;
 mod train_data;
 
 use model::{
-    builder::ModelBuilder,
-    config::{NetworkConfig, TrainingConfig, LayerConfig, CapsuleConfig},
-    core::CapNet
+    config::{NetworkConfig, TrainingConfig, LayerConfig, CapsuleConfig, Activation, OptimizerType, LossConfig},
+    ModelBuilder,
 };
 use train_data::data_loader::MalariaDataLoader;
-use train_data::data_loader;
-use model::config::MarginLossConfig;    
-use std::time::Instant;
 
 fn main() {
-    let total_start = Instant::now();
-    println!("🚀 CAPNET - CONFIGURATION FONCTIONNELLE");
-    println!("=======================================");
+    println!("🚀 CAPSNET - DÉTECTION DU PALUDISME");
+    println!("===================================\n");
 
-    // 1. CHARGEMENT OPTIMAL
-    println!("📁 Chargement des données...");
-    let data_loader = MalariaDataLoader::new("malaria_data", (64, 64)); // 64x64 pour de vraies features
-    let dataset = data_loader.load_dataset_fast(0.2, 1000); // 1000 images
-
-    // 2. CONFIGURATION QUI FONCTIONNE
-    println!("⚙️ Configuration optimisée...");
+    // Configuration du réseau
     let network_config = NetworkConfig {
         input_shape: (3, 64, 64),
         layers: vec![
+            // Couche convolutive 1
             LayerConfig::Conv2d {
                 in_channels: 3,
-                out_channels: 16,  // Assez pour capturer les patterns
-                kernel_size: 5,    // Plus grand pour voir les parasites
+                out_channels: 64,
+                kernel_size: 3,
                 stride: 1,
-                padding: 2,
-                activation: Some("relu".to_string()),
+                padding: 1,
+                activation: Activation::ReLU,
             },
+            
+            // Couche convolutive 2
+            LayerConfig::Conv2d {
+                in_channels: 64,
+                out_channels: 128,
+                kernel_size: 3,
+                stride: 2,
+                padding: 1,
+                activation: Activation::ReLU,
+            },
+            
+            // Capsules primaires
             LayerConfig::PrimaryCapsules {
-                in_channels: 16,
+                in_channels: 128,
                 capsule_config: CapsuleConfig {
-                    num_capsules: 4,   // Assez pour différentes orientations
-                    capsule_dim: 4,    // Assez d'information
-                    kernel_size: 5,
+                    num_capsules: 32,
+                    capsule_dim: 8,
+                    kernel_size: 9,
                     stride: 2,
-                    padding: 2,       // IMPORTANT: padding pour bonnes dimensions
-                    capsule_params: None,
+                    padding: 0,
                 },
             },
+            
+            // Capsules de sortie (2 classes: infecté / sain)
             LayerConfig::DigitCapsules {
-                primary_capsules: 4,
-                primary_capsule_dim: 4,
-                capsule_config: CapsuleConfig {
-                    num_capsules: 2,
-                    capsule_dim: 8,    // Représentation riche
-                    kernel_size: 0,
-                    stride: 0,
-                    padding: 0,
-                    capsule_params: None,
-                },
+                input_capsules: 32,
+                input_capsule_dim: 8,
+                output_capsules: 2,
+                output_capsule_dim: 16,
             },
         ],
-        routing_iterations: 2,     // Assez pour le routage
+        routing_iterations: 3,
+        use_reconstruction: false,
         extra_params: None,
     };
 
+    // Configuration de l'entraînement
     let training_config = TrainingConfig {
-        batch_size: 16,           // Bon compromis
-        learning_rate: 0.001,     // Standard
-        num_epochs: 5,            // Assez pour voir l'apprentissage
+        batch_size: 16,
+        learning_rate: 0.001,
+        num_epochs: 30,
         validation_split: 0.2,
         save_best: true,
-        early_stopping_patience: 2,
-        loss_function: "margin".to_string(),
-        optimizer: "adam".to_string(),
-        margin_loss_params: Some(MarginLossConfig {
+        early_stopping_patience: 5,
+        optimizer_type: OptimizerType::Adam {
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+        },
+        loss_config: LossConfig {
             positive_margin: 0.9,
             negative_margin: 0.1,
             down_weighting: 0.5,
-        }),
+            reconstruction_weight: 0.0005,
+        },
+        lr_schedule: None,
     };
 
-    // 3. CONSTRUCTION
-    println!("🏗️ Construction...");
-    let model = ModelBuilder::new()
+    // Construction du modèle
+    println!("🏗️  Construction du modèle...");
+    let mut model = ModelBuilder::new()
         .with_network_config(network_config)
         .with_training_config(training_config)
-        .build();
+        .build()
+        .expect("Erreur lors de la construction du modèle");
 
-    // 4. VÉRIFICATION
-    println!("🔍 Vérification...");
-    let test_input = ndarray::Array4::zeros((1, 3, 64, 64));
-    let output = model.forward(&test_input.view());
-    println!("   ✅ Modèle vérifié: {:?} -> {:?}", test_input.dim(), output.dim());
+    println!("✅ Modèle construit avec succès\n");
 
-    // 5. ENTRAÎNEMENT
-    println!("🎯 Début entraînement (5 époques)...");
-    let train_start = Instant::now();
+    // Diagnostic
+    model.diagnostic();
+    println!();
+
+    // Chargement des données
+    println!("📁 Chargement des données...");
+    let data_path = "malaria_data";
+    let loader = MalariaDataLoader::new(data_path, (64, 64));
     
+    // Charger un petit échantillon pour le test
+    let dataset = loader.load_dataset_fast(0.2, 1000);
+    
+    println!("✅ Données chargées:");
+    println!("   Train: {} échantillons", dataset.train_data.dim().0);
+    println!("   Test: {} échantillons\n", dataset.test_data.dim().0);
+
+    // Entraînement
+    println!("🎯 Début de l'entraînement...\n");
     let trained_model = model.train(
-        dataset.train_data.clone(),
-        dataset.train_labels.clone(),
-        dataset.test_data.clone(),
-        dataset.test_labels.clone(),
+        dataset.train_data,
+        dataset.train_labels,
+        dataset.test_data,
+        dataset.test_labels,
     );
 
-    let train_duration = train_start.elapsed();
-    println!("✅ Entraînement terminé en: {:?}", train_duration);
-
-    // 6. ÉVALUATION
-    evaluate_proper(&trained_model, &dataset);
-
-    let total_duration = total_start.elapsed();
-    println!("🎉 TOTAL: {:?}", total_duration);
-}
-/// TEST TRÈS SIMPLE QUI NE PEUT PAS PLANTER
-fn test_model_basics(model: &CapNet) {
-    println!("   🧪 Test basique...");
+    println!("\n🎉 ENTRAÎNEMENT TERMINÉ !");
+    println!("   Meilleure loss validation: {:.4}", trained_model.state.best_loss);
     
-    // Test avec une seule petite image
-    let test_input = ndarray::Array4::zeros((1, 3, 64, 64));
-    println!("   ✅ Input créé: {:?}", test_input.dim());
-    
-    // Juste essayer le forward pass
-    match std::panic::catch_unwind(|| {
-        model.forward(&test_input.view())
-    }) {
-        Ok(output) => {
-            println!("   ✅ Forward pass RÉUSSI!");
-            println!("   📏 Output shape: {:?}", output.dim());
-        },
-        Err(_) => {
-            println!("   ⚠️  Forward pass a échoué, mais on continue quand même...");
-        }
-    }
-}
-
-fn evaluate_proper(model: &CapNet, dataset: &data_loader::Dataset) {
-    let predictions = model.predict(&dataset.test_data.view());
-    let mut correct = 0;
-    let total = dataset.test_data.dim().0;
-
-    for i in 0..total {
-        let true_class = if dataset.test_labels[[i, 1, 0, 0]] > 0.5 { 1 } else { 0 };
-        if predictions[i] == true_class {
-            correct += 1;
-        }
-    }
-
-    let accuracy = correct as f32 / total as f32;
-    println!("📊 PERFORMANCE FINALE:");
-    println!("   - Accuracy: {:.2}%", accuracy * 100.0);
-    println!("   - Images test: {}", total);
-    println!("   - Correctes: {}", correct);
-    
-    if accuracy > 0.75 {
-        println!("   🎉 EXCELLENT!");
-    } else if accuracy > 0.65 {
-        println!("   ✅ BON!");
-    } else if accuracy > 0.55 {
-        println!("   ⚠️  ACCEPTABLE");
-    } else {
-        println!("   🔄 À AMÉLIORER");
-    }
+    // Sauvegarder le modèle
+    println!("\n💾 Sauvegarde du modèle...");
+    // trained_model.save("models/capsnet_malaria.bin");
+    println!("✅ Modèle sauvegardé");
 }

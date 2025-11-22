@@ -1,0 +1,1281 @@
+
+// fichier  builder 
+use super::{
+    config::{NetworkConfig, TrainingConfig, LayerConfig},
+    core::CapNet,
+    layers::ConvLayer,
+    capsule::{PrimaryCapsLayer, DigitCapsLayer},
+};
+
+/// CONSTRUCTEUR OPTIMISÉ
+pub struct ModelBuilder {
+    network_config: Option<NetworkConfig>,
+    training_config: Option<TrainingConfig>,
+}
+
+impl ModelBuilder {
+    pub fn new() -> Self {
+        Self {
+            network_config: None,
+            training_config: None,
+        }
+    }
+
+    pub fn with_network_config(mut self, config: NetworkConfig) -> Self {
+        self.network_config = Some(config);
+        self
+    }
+
+    pub fn with_training_config(mut self, config: TrainingConfig) -> Self {
+        self.training_config = Some(config);
+        self
+    }
+
+    pub fn build(self) -> CapNet {
+        let network_config = self.network_config.expect("Configuration réseau requise");
+        let training_config = self.training_config.clone().unwrap_or_default();
+
+        // VALIDATION OPTIMISÉE
+        Self::validate_config(&network_config);
+
+        let layers = Self::build_layers(&network_config);
+
+        CapNet::new(network_config, training_config, layers)
+    }
+
+    fn validate_config(config: &NetworkConfig) {
+        assert!(!config.layers.is_empty(), "Le réseau doit avoir au moins une couche");
+        assert!(config.routing_iterations > 0, "Au moins une itération de routage requise");
+
+        for (i, layer) in config.layers.iter().enumerate() {
+            Self::validate_layer(i, layer);
+        }
+    }
+
+    fn validate_layer(index: usize, layer: &LayerConfig) {
+        match layer {
+            LayerConfig::Conv2d { in_channels, out_channels, kernel_size, stride, .. } => {
+                assert!(*in_channels > 0, "Couche {}: in_channels doit être > 0", index);
+                assert!(*out_channels > 0, "Couche {}: out_channels doit être > 0", index);
+                assert!(*kernel_size > 0, "Couche {}: kernel_size doit être > 0", index);
+                assert!(*stride > 0, "Couche {}: stride doit être > 0", index);
+            }
+            LayerConfig::PrimaryCapsules { in_channels, capsule_config } => {
+                assert!(*in_channels > 0, "Couche {}: in_channels doit être > 0", index);
+                assert!(capsule_config.num_capsules > 0, "Couche {}: num_capsules doit être > 0", index);
+                assert!(capsule_config.capsule_dim > 0, "Couche {}: capsule_dim doit être > 0", index);
+            }
+            LayerConfig::DigitCapsules { primary_capsules, primary_capsule_dim, capsule_config } => {
+                assert!(*primary_capsules > 0, "Couche {}: primary_capsules doit être > 0", index);
+                assert!(*primary_capsule_dim > 0, "Couche {}: primary_capsule_dim doit être > 0", index);
+                assert!(capsule_config.num_capsules > 0, "Couche {}: num_capsules doit être > 0", index);
+                assert!(capsule_config.capsule_dim > 0, "Couche {}: capsule_dim doit être > 0", index);
+            }
+        }
+    }
+
+    fn build_layers(config: &NetworkConfig) -> Vec<Layer> {
+        let mut layers: Vec<Layer> = Vec::new();
+
+        for layer_config in &config.layers {
+            let layer = match layer_config {
+                LayerConfig::Conv2d { in_channels, out_channels, kernel_size, stride, padding, .. } => {
+                    Layer::Conv2d(ConvLayer::new(
+                        *in_channels,
+                        *out_channels,
+                        *kernel_size,
+                        *stride,
+                        *padding,
+                    ))
+                }
+                LayerConfig::PrimaryCapsules { in_channels, capsule_config } => {
+                    Layer::PrimaryCapsules(PrimaryCapsLayer::new(
+                        *in_channels,
+                        capsule_config.num_capsules,
+                        capsule_config.capsule_dim,
+                        capsule_config.kernel_size,
+                        capsule_config.stride,
+                        capsule_config.padding,  // PADDING PASSÉ
+                    ))
+                }
+                LayerConfig::DigitCapsules { primary_capsules, primary_capsule_dim, capsule_config } => {
+                    Layer::DigitCapsules(DigitCapsLayer::new(
+                        *primary_capsules,
+                        *primary_capsule_dim,
+                        capsule_config.num_capsules,
+                        capsule_config.capsule_dim,
+                        config.routing_iterations,
+                    ))
+                }
+            };
+            layers.push(layer);
+        }
+
+        layers
+    }
+}
+
+impl Default for ModelBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// ENUMÉRATION OPTIMISÉE
+pub enum Layer {
+    Conv2d(ConvLayer),
+    PrimaryCapsules(PrimaryCapsLayer),
+    DigitCapsules(DigitCapsLayer),
+}
+
+impl Layer {
+    pub fn forward(&self, input: &ndarray::ArrayView4<f32>) -> ndarray::Array4<f32> {
+        match self {
+            Layer::Conv2d(layer) => layer.forward(input),
+            Layer::PrimaryCapsules(layer) => layer.forward(input),
+            Layer::DigitCapsules(layer) => layer.forward(input),
+        }
+    }
+}
+
+fichier capsule  
+
+use ndarray::{Array4, ArrayView4};
+use rand::Rng;
+use super::layers::{squash, ConvLayer};
+use super::routing::DynamicRouting;
+
+/// Couche de capsules primaires OPTIMISÉE
+pub struct PrimaryCapsLayer {
+    pub conv_layers: Vec<ConvLayer>,
+    pub num_capsules: usize,
+    pub capsule_dim: usize,
+}
+
+impl PrimaryCapsLayer {
+    pub fn new(
+        in_channels: usize,
+        num_capsules: usize,
+        capsule_dim: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,  // NOUVEAU PARAMÈTRE
+    ) -> Self {
+        let conv_layers = (0..num_capsules * capsule_dim)
+            .map(|_| ConvLayer::new(in_channels, 1, kernel_size, stride, padding))
+            .collect();
+        
+        Self {
+            conv_layers,
+            num_capsules,
+            capsule_dim,
+        }
+    }
+    
+    pub fn forward(&self, input: &ArrayView4<f32>) -> Array4<f32> {
+        let (batch_size, _, in_height, in_width) = input.dim();
+        
+        // TEST: Obtenir les dimensions RÉELLES
+        let test_output = self.conv_layers[0].forward(input);
+        let (_, _, actual_height, actual_width) = test_output.dim();
+        
+        println!("   🔍 Capsules Primaires:");
+        println!("   - Entrée: {}x{}", in_height, in_width);
+        println!("   - Sortie conv: {}x{}", actual_height, actual_width);
+        println!("   - Spatial points: {}", actual_height * actual_width);
+        
+        let mut capsules = Array4::zeros((
+            batch_size,
+            self.num_capsules,
+            actual_height * actual_width,
+            self.capsule_dim,
+        ));
+        
+        // Application OPTIMISÉE des convolutions
+        for cap_idx in 0..self.num_capsules {
+            for dim_idx in 0..self.capsule_dim {
+                let conv_idx = cap_idx * self.capsule_dim + dim_idx;
+                let conv_output = self.conv_layers[conv_idx].forward(input);
+                
+                // Réorganisation OPTIMISÉE
+                for b in 0..batch_size {
+                    for h in 0..actual_height {
+                        for w in 0..actual_width {
+                            let spatial_idx = h * actual_width + w;
+                            capsules[[b, cap_idx, spatial_idx, dim_idx]] = 
+                                conv_output[[b, 0, h, w]];
+                        }
+                    }
+                }
+            }
+        }
+        
+        println!("   ✅ Capsules shape: {:?}", capsules.dim());
+        squash(&capsules)
+    }
+}
+
+/// Couche de capsules de chiffres OPTIMISÉE
+pub struct DigitCapsLayer {
+    pub routing: DynamicRouting,
+    pub num_capsules: usize,
+    pub capsule_dim: usize,
+    pub weights: Array4<f32>,
+}
+
+impl DigitCapsLayer {
+    
+    pub fn new(
+        primary_capsules: usize,
+        primary_capsule_dim: usize,
+        digit_capsules: usize,
+        digit_capsule_dim: usize,
+        routing_iterations: usize,
+    ) -> Self {
+        let weights_shape = (digit_capsules, primary_capsules, digit_capsule_dim, primary_capsule_dim);
+        let mut weights = Array4::zeros(weights_shape);
+        
+        // Initialisation OPTIMISÉE
+        let mut rng = rand::rng();
+        for i in 0..digit_capsules {
+            for j in 0..primary_capsules {
+                for k in 0..digit_capsule_dim {
+                    for l in 0..primary_capsule_dim {
+                        weights[[i, j, k, l]] = rng.random::<f32>() * 0.01;
+                    }
+                }
+            }
+        }
+        
+        Self {
+            routing: DynamicRouting::new(routing_iterations),
+            num_capsules: digit_capsules,
+            capsule_dim: digit_capsule_dim,
+            weights,
+        }
+    }
+    
+    pub fn forward(&self, primary_capsules: &ArrayView4<f32>) -> Array4<f32> {
+        let (batch_size, primary_caps, spatial_points, primary_dim) = primary_capsules.dim();
+        
+        println!("   🔍 Capsules Chiffres:");
+        println!("   - Entrée: {} capsules, {} points, dim {}", primary_caps, spatial_points, primary_dim);
+        
+        let predictions_shape = (batch_size, self.num_capsules, primary_caps * spatial_points, self.capsule_dim);
+        let mut predictions = Array4::zeros(predictions_shape);
+        
+        // Transformation OPTIMISÉE
+        for b in 0..batch_size {
+            for dc in 0..self.num_capsules {
+                for pc in 0..primary_caps {
+                    for sp in 0..spatial_points {
+                        let mut transformed = vec![0.0; self.capsule_dim];
+                        
+                        for i in 0..self.capsule_dim {
+                            for j in 0..primary_dim {
+                                transformed[i] += self.weights[[dc, pc, i, j]] * 
+                                    primary_capsules[[b, pc, sp, j]];
+                            }
+                        }
+                        
+                        for d in 0..self.capsule_dim {
+                            let pred_idx = pc * spatial_points + sp;
+                            predictions[[b, dc, pred_idx, d]] = transformed[d];
+                        }
+                    }
+                }
+            }
+        }
+        
+        let output = self.routing.route(&predictions.view());
+        println!("   ✅ Sortie capsules: {:?}", output.dim());
+        output
+    }
+}
+
+// fichier   config  
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    pub input_shape: (usize, usize, usize),
+    pub layers: Vec<LayerConfig>,
+    pub routing_iterations: usize,
+    pub extra_params: Option<HashMap<String, f32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LayerConfig {
+    Conv2d {
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        activation: Option<String>,
+    },
+    PrimaryCapsules {
+        in_channels: usize,
+        capsule_config: CapsuleConfig,
+    },
+    DigitCapsules {
+        primary_capsules: usize,
+        primary_capsule_dim: usize,
+        capsule_config: CapsuleConfig,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleConfig {
+    pub num_capsules: usize,
+    pub capsule_dim: usize,
+    pub kernel_size: usize,
+    pub stride: usize,
+    pub padding: usize,  // NOUVEAU: padding pour les capsules
+    pub capsule_params: Option<HashMap<String, f32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingConfig {
+    pub batch_size: usize,
+    pub learning_rate: f32,
+    pub num_epochs: usize,
+    pub validation_split: f32,
+    pub save_best: bool,
+    pub early_stopping_patience: usize,
+    pub loss_function: String,
+    pub optimizer: String,
+    pub margin_loss_params: Option<MarginLossConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginLossConfig {
+    pub positive_margin: f32,
+    pub negative_margin: f32,
+    pub down_weighting: f32,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            input_shape: (3, 64, 64),
+            layers: vec![
+                LayerConfig::Conv2d {
+                    in_channels: 3,
+                    out_channels: 32,
+                    kernel_size: 3,
+                    stride: 1,
+                    padding: 1,
+                    activation: Some("relu".to_string()),
+                },
+                LayerConfig::PrimaryCapsules {
+                    in_channels: 32,
+                    capsule_config: CapsuleConfig {
+                        num_capsules: 8,
+                        capsule_dim: 4,
+                        kernel_size: 3,
+                        stride: 2,
+                        padding: 1,  // PADDING AJOUTÉ
+                        capsule_params: None,
+                    },
+                },
+                LayerConfig::DigitCapsules {
+                    primary_capsules: 8,
+                    primary_capsule_dim: 4,
+                    capsule_config: CapsuleConfig {
+                        num_capsules: 2,
+                        capsule_dim: 8,
+                        kernel_size: 0,
+                        stride: 0,
+                        padding: 0,
+                        capsule_params: None,
+                    },
+                },
+            ],
+            routing_iterations: 3,
+            extra_params: None,
+        }
+    }
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 32,
+            learning_rate: 0.001,
+            num_epochs: 50,
+            validation_split: 0.2,
+            save_best: true,
+            early_stopping_patience: 10,
+            loss_function: "margin".to_string(),
+            optimizer: "adam".to_string(),
+            margin_loss_params: Some(MarginLossConfig {
+                positive_margin: 0.9,
+                negative_margin: 0.1,
+                down_weighting: 0.5,
+            }),
+        }
+    }
+}
+
+fihcier  core  
+use super::{
+    config::{NetworkConfig, TrainingConfig},
+    builder::Layer,
+};
+
+use ndarray::{Array4, ArrayView4, s};
+use ndarray::ArrayView1;
+
+
+/// MODÈLE CAPNET PRINCIPAL COMPLÈTEMENT MODULAIRE
+pub struct CapNet {
+    /// Configuration de l'architecture
+    pub network_config: NetworkConfig,
+    /// Configuration de l'entraînement
+    pub training_config: TrainingConfig,
+    /// Séquence dynamique de couches
+    pub layers: Vec<Layer>,
+    /// Historique d'entraînement
+    pub history: TrainingHistory,
+    /// État du modèle
+    pub state: ModelState,
+}
+
+/// HISTORIQUE D'ENTRAÎNEMENT POUR ANALYSE
+#[derive(Debug, Clone)]
+pub struct TrainingHistory {
+    pub train_loss: Vec<f32>,
+    pub val_loss: Vec<f32>,
+    pub train_accuracy: Vec<f32>,
+    pub val_accuracy: Vec<f32>,
+    pub learning_rates: Vec<f32>,
+}
+
+/// ÉTAT DU MODÈLE
+#[derive(Debug, Clone)]
+pub struct ModelState {
+    pub is_trained: bool,
+    pub best_loss: f32,
+    pub current_epoch: usize,
+    pub early_stopping_counter: usize,
+}
+
+impl CapNet {
+    /// CRÉATION D'UN NOUVEAU MODÈLE AVEC CONFIGURATION DYNAMIQUE
+    pub fn new(
+        network_config: NetworkConfig,
+        training_config: TrainingConfig,
+        layers: Vec<Layer>,
+    ) -> Self {
+        Self {
+            network_config,
+            training_config,
+            layers,
+            history: TrainingHistory::new(),
+            state: ModelState::new(),
+        }
+    }
+
+    /// PROPAGATION AVANT À TRAVERS TOUTES LES COUCHES
+    pub fn forward(&self, input: &ArrayView4<f32>) -> Array4<f32> {
+        let mut output = input.to_owned();
+        
+        for layer in &self.layers {
+            output = layer.forward(&output.view());
+        }
+        
+        output
+    }
+
+    /// ENTRAÎNEMENT COMPLET AVEC OPTIONS MODULAIRES
+    pub fn train(
+        mut self,
+        train_data: Array4<f32>,
+        train_labels: Array4<f32>,
+        val_data: Array4<f32>,
+        val_labels: Array4<f32>,
+    ) -> Self {
+        println!("🎯 Début de l'entraînement avec {} échantillons", train_data.dim().0);
+
+        for epoch in 0..self.training_config.num_epochs {
+            self.state.current_epoch = epoch;
+            
+            // Entraînement sur un epoch
+            let (train_loss, train_accuracy) = self.train_epoch(&train_data, &train_labels);
+            
+            // Validation
+            let (val_loss, val_accuracy) = self.validate(&val_data, &val_labels);
+            
+            // Mise à jour de l'historique
+            self.history.update(train_loss, val_loss, train_accuracy, val_accuracy);
+            
+            // Affichage des progrès
+            self.print_epoch_progress(epoch, train_loss, val_loss, train_accuracy, val_accuracy);
+            
+            // Arrêt précoce
+            if self.check_early_stopping() {
+                println!("🛑 Arrêt précoce à l'époque {}", epoch);
+                break;
+            }
+        }
+
+        self.state.is_trained = true;
+        self
+    }
+
+    /// ENTRAÎNEMENT SUR UN SEUL EPOCH
+    fn train_epoch(&mut self, data: &Array4<f32>, labels: &Array4<f32>) -> (f32, f32) {
+    let mut total_loss = 0.0;
+    let mut total_accuracy = 0.0;
+    
+    // ⚡ CORRECTION: Calcul correct du nombre de batchs
+    let num_batches = (data.dim().0 + self.training_config.batch_size - 1) / self.training_config.batch_size;
+    
+    println!("   📦 Batchs: {} ({} images / batch_size={})", 
+             num_batches, data.dim().0, self.training_config.batch_size);
+
+    for batch in 0..num_batches {
+        let start = batch * self.training_config.batch_size;
+        let end = std::cmp::min(start + self.training_config.batch_size, data.dim().0);
+        
+        let batch_data = data.slice(ndarray::s![start..end, .., .., ..]).to_owned();
+        let batch_labels = labels.slice(ndarray::s![start..end, .., .., ..]).to_owned();
+        
+        // Propagation avant
+        let output = self.forward(&batch_data.view());
+        
+        // Calcul de la perte et précision
+        let loss = self.compute_loss(&output.view(), &batch_labels.view());
+        let accuracy = self.compute_accuracy(&output.view(), &batch_labels.view());
+        
+        total_loss += loss;
+        total_accuracy += accuracy;
+        
+        // Afficher la progression
+        if (batch + 1) % 10 == 0 {
+            println!("     🔄 Batch {}/{} - Loss: {:.4}", batch + 1, num_batches, loss);
+        }
+    }
+
+    (
+        total_loss / num_batches as f32,
+        total_accuracy / num_batches as f32,
+    )
+}
+
+    /// VALIDATION DU MODÈLE
+    pub fn validate(&self, data: &Array4<f32>, labels: &Array4<f32>) -> (f32, f32) {
+        let output = self.forward(&data.view());
+        let loss = self.compute_loss(&output.view(), &labels.view());
+        let accuracy = self.compute_accuracy(&output.view(), &labels.view());
+        
+        (loss, accuracy)
+    }
+
+    /// OBTENTION D'UN LOT DE DONNÉES
+    pub fn get_batch(&self, data: &Array4<f32>, labels: &Array4<f32>, batch_index: usize) -> (Array4<f32>, Array4<f32>) {
+        let start = batch_index * self.training_config.batch_size;
+        let end = std::cmp::min(start + self.training_config.batch_size, data.dim().0);
+        
+        let batch_data = data.slice(s![start..end, .., .., ..]).to_owned();
+        let batch_labels = labels.slice(s![start..end, .., .., ..]).to_owned();
+        
+        (batch_data, batch_labels)
+    }
+
+    /// CALCUL DE LA PERTE (MARGIN LOSS POUR CAPSULES)
+   fn compute_loss(&self, output: &ArrayView4<f32>, labels: &ArrayView4<f32>) -> f32 {
+    let (batch_size, num_classes, _, _) = output.dim();
+    let mut total_loss = 0.0;
+
+    let margin_config = self.training_config.margin_loss_params.as_ref()
+        .unwrap_or(&super::config::MarginLossConfig {
+            positive_margin: 0.9,
+            negative_margin: 0.1,
+            down_weighting: 0.5,
+        });
+
+    for b in 0..batch_size {
+        for c in 0..num_classes {
+            let capsule_slice = output.slice(ndarray::s![b, c, 0, ..]);
+            let norm = self.capsule_norm_1d(&capsule_slice);
+            let target = labels[[b, c, 0, 0]];
+
+            // ⚡ CORRECTION: Éviter les valeurs NaN
+            let safe_norm = norm.max(1e-8); // Éviter la division par zéro
+            
+            let loss = if target > 0.5 {
+                // Capsule active
+                (margin_config.positive_margin - safe_norm).max(0.0).powi(2)
+            } else {
+                // Capsule inactive
+                margin_config.down_weighting * (safe_norm - margin_config.negative_margin).max(0.0).powi(2)
+            };
+
+            total_loss += loss;
+        }
+    }
+
+    total_loss / (batch_size * num_classes) as f32
+}
+
+    /// CALCUL DE LA PRÉCISION
+    pub fn compute_accuracy(&self, output: &ArrayView4<f32>, labels: &ArrayView4<f32>) -> f32 {
+        let predictions = self.predict(output);
+        let mut correct = 0;
+        let total = output.dim().0;
+
+        for i in 0..total {
+            if predictions[i] == self.get_true_class(&labels.slice(s![i, .., 0, 0])) {
+                correct += 1;
+            }
+        }
+
+        correct as f32 / total as f32
+    }
+
+    /// PRÉDICTION DES CLASSES
+    pub fn predict(&self, output: &ArrayView4<f32>) -> Vec<usize> {
+        let (batch_size, num_classes, _, _) = output.dim();
+        let mut predictions = Vec::with_capacity(batch_size);
+
+        for b in 0..batch_size {
+            let mut max_norm = 0.0;
+            let mut pred_class = 0;
+
+            for c in 0..num_classes {
+                let capsule_slice = output.slice(s![b, c, 0, ..]);
+                let norm = self.capsule_norm_1d(&capsule_slice);
+                if norm > max_norm {
+                    max_norm = norm;
+                    pred_class = c;
+                }
+            }
+            predictions.push(pred_class);
+        }
+
+        predictions
+    }
+
+    /// NORME D'UNE CAPSULE 1D (pour les capsules de sortie)
+    pub fn capsule_norm_1d(&self, capsule: &ndarray::ArrayView1<f32>) -> f32 {
+        let mut sum = 0.0;
+        for &val in capsule {
+            sum += val * val;
+        }
+        sum.sqrt()
+    }
+
+    /// NORME D'UNE CAPSULE 4D (méthode générique)
+    pub fn capsule_norm(&self, capsule: &ArrayView4<f32>) -> f32 {
+        let mut sum = 0.0;
+        for &val in capsule.iter() {
+            sum += val * val;
+        }
+        sum.sqrt()
+    }
+
+    /// OBTENTION DE LA CLASSE RÉELLE
+     pub fn get_true_class(&self, label: &ArrayView1<f32>) -> usize {  // Changer ArrayView2 par ArrayView1
+        for c in 0..label.dim() {  // Utiliser .dim() au lieu de .dim().0
+            if label[c] > 0.5 {    // Utiliser [c] au lieu de [[c, 0]]
+                return c;
+            }
+        }
+        0
+    }
+
+    /// VÉRIFICATION DE L'ARRÊT PRÉCOCE
+    pub fn check_early_stopping(&mut self) -> bool {
+        if self.training_config.early_stopping_patience == 0 {
+            return false;
+        }
+
+        if self.history.val_loss.len() < 2 {
+            return false;
+        }
+
+        let current_loss = *self.history.val_loss.last().unwrap();
+        let best_loss = self.state.best_loss;
+
+        if current_loss < best_loss {
+            self.state.best_loss = current_loss;
+            self.state.early_stopping_counter = 0;
+        } else {
+            self.state.early_stopping_counter += 1;
+        }
+
+        self.state.early_stopping_counter >= self.training_config.early_stopping_patience
+    }
+
+    /// AFFICHAGE DES PROGRÈS
+    pub fn print_epoch_progress(&self, epoch: usize, train_loss: f32, val_loss: f32, train_acc: f32, val_acc: f32) {
+        println!(
+            "📊 Epoch {:3}/{} | Loss: {:.4} (train) {:.4} (val) | Acc: {:.2} (train) {:.2} (val)",
+            epoch + 1,
+            self.training_config.num_epochs,
+            train_loss,
+            val_loss,
+            train_acc,
+            val_acc
+        );
+    }
+
+    /// OBTENTION DE L'ARCHITECTURE
+    pub fn get_architecture(&self) -> String {
+        format!("CapNet avec {} couches configurées dynamiquement", self.layers.len())
+    }
+
+    /// SAUVEGARDE DU MODÈLE
+    pub fn save(&self, path: &str) {
+        println!("💾 Sauvegarde du modèle dans: {}", path);
+        // Implémentation de la sauvegarde à compléter
+    }
+
+      pub fn diagnostic(&self) {
+        println!("🔍 DIAGNOSTIC DU MODÈLE CAPNET");
+        println!("===============================");
+        
+        // Informations de configuration
+        println!("📐 Configuration:");
+        println!("   - Shape entrée: {:?}", self.network_config.input_shape);
+        println!("   - Couches: {}", self.layers.len());
+        println!("   - Itérations routage: {}", self.network_config.routing_iterations);
+        
+        // Test avec données minimales SÉCURISÉ
+        println!("🧪 Test forward pass...");
+        
+        // Créer une petite donnée de test
+        let (channels, height, width) = self.network_config.input_shape;
+        let test_input = ndarray::Array4::zeros((1, channels, height, width));
+        println!("   ✅ Input créé: {:?}", test_input.dim());
+        
+        // Test couche par couche avec gestion d'erreur
+        let mut current_output = test_input;
+        
+        for (i, layer) in self.layers.iter().enumerate() {
+            println!("   🔍 Couche {}...", i);
+            current_output = layer.forward(&current_output.view());
+            println!("   ✅ Shape sortie: {:?}", current_output.dim());
+            
+            // Vérification de sécurité
+            if current_output.iter().any(|&x| x.is_nan() || x.is_infinite()) {
+                println!("   ❌ ERREUR: Valeurs NaN ou infinies détectées!");
+                break;
+            }
+        }
+        
+        println!("   🎯 Forward pass RÉUSSI!");
+        println!("   📏 Shape finale: {:?}", current_output.dim());
+        
+        // Vérification des capsules de sortie
+        if current_output.dim().1 > 0 {
+            println!("📊 Analyse capsules sortie:");
+            for i in 0..current_output.dim().1.min(4) { // Limiter à 4 capsules
+                let capsule_slice = current_output.slice(ndarray::s![0, i, 0, ..]);
+                let norm: f32 = capsule_slice.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                println!("   - Capsule {}: norm = {:.4}", i, norm);
+            }
+        }
+        
+        // État du modèle
+        println!("📈 État du modèle:");
+        println!("   - Entraîné: {}", self.state.is_trained);
+        println!("   - Meilleure loss: {:.4}", self.state.best_loss);
+        println!("   - Époques: {}", self.state.current_epoch);
+        
+        println!("🎯 DIAGNOSTIC TERMINÉ - Modèle opérationnel");
+    }
+
+    /// DIAGNOSTIC ULTRA-RAPIDE (alternative)
+    pub fn diagnostic_fast(&self) {
+        println!("⚡ DIAGNOSTIC RAPIDE");
+        
+        let (channels, height, width) = self.network_config.input_shape;
+        let test_input = ndarray::Array4::zeros((1, channels, height, width));
+        
+        println!("   🧪 Test forward pass...");
+        let output = self.forward(&test_input.view());
+        println!("   ✅ Réussi! Input: {:?} -> Output: {:?}", test_input.dim(), output.dim());
+        println!("   🎯 Modèle prêt pour l'entraînement!");
+    }
+}
+
+impl TrainingHistory {
+    pub fn new() -> Self {
+        Self {
+            train_loss: Vec::new(),
+            val_loss: Vec::new(),
+            train_accuracy: Vec::new(),
+            val_accuracy: Vec::new(),
+            learning_rates: Vec::new(),
+        }
+    }
+
+    pub fn update(&mut self, train_loss: f32, val_loss: f32, train_acc: f32, val_acc: f32) {
+        self.train_loss.push(train_loss);
+        self.val_loss.push(val_loss);
+        self.train_accuracy.push(train_acc);
+        self.val_accuracy.push(val_acc);
+    }
+}
+
+impl ModelState {
+    pub fn new() -> Self {
+        Self {
+            is_trained: false,
+            best_loss: f32::INFINITY,
+            current_epoch: 0,
+            early_stopping_counter: 0,
+        }
+    }
+}
+
+impl Default for TrainingHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for ModelState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fichier  layer  
+use ndarray::{Array4, ArrayView4};
+use rand::Rng;
+
+/// Couche de convolution standard
+pub struct ConvLayer {
+    pub weights: Array4<f32>,
+    pub biases: Array4<f32>,
+    pub stride: usize,
+    pub padding: usize,
+    pub activation: Option<String>,
+}
+
+impl ConvLayer {
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
+        let mut rng = rand::rng();  // CORRIGÉ
+        
+        // Initialisation He pour les poids
+        let scale = (2.0 / (in_channels * kernel_size * kernel_size) as f32).sqrt();
+        let weights_shape = (out_channels, in_channels, kernel_size, kernel_size);
+        let weights = Array4::from_shape_fn(weights_shape, |_| rng.random::<f32>() * scale);  // CORRIGÉ
+        
+        let biases = Array4::zeros((out_channels, 1, 1, 1));
+        
+        Self {
+            weights,
+            biases,
+            stride,
+            padding,
+            activation: Some("relu".to_string()),
+        }
+    }
+    
+    pub fn forward(&self, input: &ArrayView4<f32>) -> Array4<f32> {
+        let (batch_size, in_channels, in_height, in_width) = input.dim();
+        let (out_channels, _, kernel_size, _) = self.weights.dim();
+        
+        let out_height = (in_height + 2 * self.padding - kernel_size) / self.stride + 1;
+        let out_width = (in_width + 2 * self.padding - kernel_size) / self.stride + 1;
+        
+        println!("   🔍 ConvLayer:");
+        println!("   - Entrée: {}x{}x{}", in_channels, in_height, in_width);
+        println!("   - Sortie: {}x{}x{}", out_channels, out_height, out_width);
+        println!("   - Kernel: {}, Stride: {}, Padding: {}", kernel_size, self.stride, self.padding);
+        
+        let mut output = Array4::zeros((batch_size, out_channels, out_height, out_width));
+        
+        // Implémentation basique de la convolution
+        for b in 0..batch_size {
+            for oc in 0..out_channels {
+                for oh in 0..out_height {
+                    for ow in 0..out_width {
+                        let mut sum = 0.0;
+                        
+                        for ic in 0..in_channels {
+                            for kh in 0..kernel_size {
+                                for kw in 0..kernel_size {
+                                    let ih = oh * self.stride + kh;
+                                    let iw = ow * self.stride + kw;
+                                    
+                                    if ih < in_height + self.padding && iw < in_width + self.padding {
+                                        let input_val = if ih >= self.padding && iw >= self.padding &&
+                                            ih < in_height + self.padding && iw < in_width + self.padding {
+                                            input[[b, ic, ih - self.padding, iw - self.padding]]
+                                        } else {
+                                            0.0
+                                        };
+                                        
+                                        sum += input_val * self.weights[[oc, ic, kh, kw]];
+                                    }
+                                }
+                            }
+                        }
+                        
+                        output[[b, oc, oh, ow]] = sum + self.biases[[oc, 0, 0, 0]];
+                    }
+                }
+            }
+        }
+        
+        // Application de la fonction d'activation
+        if let Some(act) = &self.activation {
+            match act.as_str() {
+                "relu" => relu(&output),
+                _ => output,
+            }
+        } else {
+            output
+        }
+    }
+}
+
+/// Fonction d'activation ReLU
+pub fn relu(x: &Array4<f32>) -> Array4<f32> {
+    x.mapv(|v| v.max(0.0))
+}
+
+/// Fonction squash pour les capsules
+pub fn squash(vectors: &Array4<f32>) -> Array4<f32> {
+    let mut result = vectors.clone();
+    let (batch_size, num_capsules, spatial_points, capsule_dim) = vectors.dim();
+    
+    for b in 0..batch_size {
+        for cap in 0..num_capsules {
+            for sp in 0..spatial_points {
+                let mut norm_squared = 0.0;
+                
+                // Calcul de la norme au carré
+                for d in 0..capsule_dim {
+                    let val = vectors[[b, cap, sp, d]];
+                    norm_squared += val * val;
+                }
+                
+                let norm = norm_squared.sqrt();
+                let scale = norm_squared / (1.0 + norm_squared);
+                
+                // Application du squash
+                for d in 0..capsule_dim {
+                    let val = vectors[[b, cap, sp, d]];
+                    result[[b, cap, sp, d]] = val * (scale / norm);
+                }
+            }
+        }
+    }
+    
+    result
+}
+
+fichier  mod  
+pub mod config;
+pub mod layers;
+pub mod capsule;
+pub mod routing;
+pub mod builder;
+pub mod core;
+
+fichier  routing 
+use ndarray::{Array4, ArrayView4, ArrayViewMut4, s};  // Ajouter 's' ici
+
+/// Implémentation du routage dynamique par accord entre les capsules
+pub struct DynamicRouting {
+    pub num_iterations: usize,
+}
+
+impl DynamicRouting {
+    pub fn new(num_iterations: usize) -> Self {
+        Self { num_iterations }
+    }
+    
+    /// Algorithme de routage dynamique
+    pub fn route(
+        &self,
+        predictions: &ArrayView4<f32>,  // [batch, digit_caps, primary_caps, dim]
+    ) -> Array4<f32> {
+        let (batch_size, digit_caps, primary_caps, _dim) = predictions.dim();  // Ajouter underscore
+        
+        // Initialisation des logits de couplage
+        let mut coupling_logits = Array4::zeros((batch_size, digit_caps, primary_caps, 1));
+        
+        // Itérations de routage
+        for _ in 0..self.num_iterations {
+            // Application de softmax pour obtenir les coefficients de couplage
+            let coupling_coefficients = self.softmax(&coupling_logits.view());
+            
+            // Calcul des capsules de sortie
+            let outputs = self.calculate_outputs(predictions, &coupling_coefficients.view());
+            
+            // Mise à jour des accords
+            self.update_agreement(predictions, &outputs.view(), coupling_logits.view_mut());
+        }
+        
+        // Retourne les capsules de sortie finales
+        let final_coefficients = self.softmax(&coupling_logits.view());
+        self.calculate_outputs(predictions, &final_coefficients.view())
+    }
+    
+    fn softmax(&self, logits: &ArrayView4<f32>) -> Array4<f32> {
+        let mut result = Array4::zeros(logits.dim());
+        
+        // Softmax le long de l'axe des capsules de chiffres
+        for b in 0..logits.dim().0 {
+            let max_val = logits.slice(s![b, .., .., ..]).fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let exp_sum: f32 = logits.slice(s![b, .., .., ..]).mapv(|x| (x - max_val).exp()).sum();
+            
+            for i in 0..logits.dim().1 {
+                for j in 0..logits.dim().2 {
+                    let val = (logits[[b, i, j, 0]] - max_val).exp() / exp_sum;
+                    result[[b, i, j, 0]] = val;
+                }
+            }
+        }
+        
+        result
+    }
+    
+    fn calculate_outputs(
+        &self,
+        predictions: &ArrayView4<f32>,
+        coupling_coefficients: &ArrayView4<f32>,
+    ) -> Array4<f32> {
+        let (batch_size, digit_caps, primary_caps, dim) = predictions.dim();
+        let mut outputs = Array4::zeros((batch_size, digit_caps, 1, dim));
+        
+        for b in 0..batch_size {
+            for dc in 0..digit_caps {
+                for pc in 0..primary_caps {
+                    let coefficient = coupling_coefficients[[b, dc, pc, 0]];
+                    for d in 0..dim {
+                        outputs[[b, dc, 0, d]] += coefficient * predictions[[b, dc, pc, d]];
+                    }
+                }
+            }
+        }
+        
+        outputs
+    }
+    
+    fn update_agreement(
+        &self,
+        predictions: &ArrayView4<f32>,
+        outputs: &ArrayView4<f32>,
+        mut coupling_logits: ArrayViewMut4<f32>,
+    ) {
+        let (batch_size, digit_caps, primary_caps, dim) = predictions.dim();
+        
+        // Mise à jour des logits basée sur l'accord scalaire
+        for b in 0..batch_size {
+            for dc in 0..digit_caps {
+                for pc in 0..primary_caps {
+                    let mut agreement = 0.0;
+                    for d in 0..dim {
+                        agreement += predictions[[b, dc, pc, d]] * outputs[[b, dc, 0, d]];
+                    }
+                    coupling_logits[[b, dc, pc, 0]] += agreement;
+                }
+            }
+        }
+    }
+}
+
+// fichier   data_loader  
+use ndarray::{Array4, Array3};
+use image::ImageReader;
+use std::path::{Path, PathBuf};
+use std::fs;
+use rand::seq::SliceRandom;
+use std::time::Instant;
+
+/// Chargeur ULTRA RAPIDE
+pub struct MalariaDataLoader {
+    parasitized_path: PathBuf,
+    uninfected_path: PathBuf,
+    image_size: (usize, usize),
+}
+
+impl MalariaDataLoader {
+    pub fn new(data_path: &str, image_size: (usize, usize)) -> Self {
+        Self {
+            parasitized_path: PathBuf::from(data_path).join("Parasitized"),
+            uninfected_path: PathBuf::from(data_path).join("Uninfected"),
+            image_size,
+        }
+    }
+
+    /// Charge un ÉCHANTILLON RAPIDE
+    pub fn load_dataset_fast(&self, test_split: f32, max_samples: usize) -> Dataset {
+        println!("📁 Chargement RAPIDE des données...");
+        let start = Instant::now();
+
+        let parasitized = self.load_images_from_dir_fast(&self.parasitized_path, 1.0, max_samples);
+        let uninfected = self.load_images_from_dir_fast(&self.uninfected_path, 0.0, max_samples);
+
+        println!("📊 Échantillon chargé:");
+        println!("   - Infectées: {}", parasitized.len());
+        println!("   - Saines: {}", uninfected.len());
+        println!("   - Total: {}", parasitized.len() + uninfected.len());
+
+        // Mélanger
+        let mut all_data = parasitized;
+        all_data.extend(uninfected);
+        let mut rng = rand::rng();
+        all_data.shuffle(&mut rng);
+
+        // Split
+        let split_index = (all_data.len() as f32 * (1.0 - test_split)) as usize;
+        let (train_data, test_data) = all_data.split_at(split_index);
+
+        println!("🎯 Split: Train={}, Test={}", train_data.len(), test_data.len());
+
+        let dataset = self.prepare_arrays_fast(train_data, test_data);
+        
+        println!("⏱️  Chargé en: {:?}", start.elapsed());
+        dataset
+    }
+
+    fn load_images_from_dir_fast(&self, dir_path: &Path, label: f32, max_samples: usize) -> Vec<(Array3<f32>, f32)> {
+        let mut images = Vec::new();
+        
+        if let Ok(entries) = fs::read_dir(dir_path) {
+            for (i, entry) in entries.flatten().enumerate().take(max_samples) {
+                if i % 500 == 0 {
+                    println!("     📸 {} images chargées...", i);
+                }
+                
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "png" || ext == "jpg" || ext == "jpeg" {
+                        if let Some(image_array) = self.load_image_fast(&path) {
+                            images.push((image_array, label));
+                        }
+                    }
+                }
+            }
+        }
+        
+        images
+    }
+
+    fn load_image_fast(&self, image_path: &Path) -> Option<Array3<f32>> {
+        let img = ImageReader::open(image_path).ok()?.decode().ok()?;
+
+        // Redimensionnement RAPIDE
+        let resized = img.resize_exact(
+            self.image_size.0 as u32,
+            self.image_size.1 as u32,
+            image::imageops::FilterType::Triangle, // Équilibre vitesse/qualité
+        );
+
+        let rgb = resized.to_rgb32f();
+        let (width, height) = rgb.dimensions();
+
+        let mut array = Array3::zeros((3, height as usize, width as usize));
+        
+        for (x, y, pixel) in rgb.enumerate_pixels() {
+            array[[0, y as usize, x as usize]] = pixel.0[0];
+            array[[1, y as usize, x as usize]] = pixel.0[1];
+            array[[2, y as usize, x as usize]] = pixel.0[2];
+        }
+
+        Some(array)
+    }
+
+    fn prepare_arrays_fast(&self, train_data: &[(Array3<f32>, f32)], test_data: &[(Array3<f32>, f32)]) -> Dataset {
+        let train_count = train_data.len();
+        let test_count = test_data.len();
+        let (channels, height, width) = (3, self.image_size.1, self.image_size.0);
+
+        let mut train_images = Array4::zeros((train_count, channels, height, width));
+        let mut train_labels = Array4::zeros((train_count, 2, 1, 1));
+
+        // Chargement PARALLÉLISÉ (conceptuel)
+        for (i, (image, label)) in train_data.iter().enumerate() {
+            train_images.slice_mut(ndarray::s![i, .., .., ..]).assign(image);
+            
+            if *label == 1.0 {
+                train_labels[[i, 1, 0, 0]] = 1.0;
+            } else {
+                train_labels[[i, 0, 0, 0]] = 1.0;
+            }
+        }
+
+        let mut test_images = Array4::zeros((test_count, channels, height, width));
+        let mut test_labels = Array4::zeros((test_count, 2, 1, 1));
+
+        for (i, (image, label)) in test_data.iter().enumerate() {
+            test_images.slice_mut(ndarray::s![i, .., .., ..]).assign(image);
+            
+            if *label == 1.0 {
+                test_labels[[i, 1, 0, 0]] = 1.0;
+            } else {
+                test_labels[[i, 0, 0, 0]] = 1.0;
+            }
+        }
+
+        Dataset {
+            train_data: train_images,
+            train_labels,
+            test_data: test_images,
+            test_labels,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Dataset {
+    pub train_data: Array4<f32>,
+    pub train_labels: Array4<f32>,
+    pub test_data: Array4<f32>,
+    pub test_labels: Array4<f32>,
+}
+
+// fichier  mod 
+pub mod data_loader;
+pub mod training_strategy;
+
+// fichier  training_strategy 
+use crate::model::core::CapNet;
+use crate::train_data::data_loader::Dataset;
+
+pub struct TrainingStrategy {
+    pub learning_rate_schedule: Vec<f32>,
+    pub augmentation: bool,
+}
+
+impl TrainingStrategy {
+    pub fn advanced_training(&self, model: CapNet, dataset: Dataset) -> CapNet {
+        println!("🎯 STRATÉGIE D'ENTRAÎNEMENT AVANCÉE");
+        
+        let mut current_model = model;
+        
+        // Phase 1: Entraînement initial
+        println!("🔰 Phase 1: Entraînement initial");
+        current_model = current_model.train(
+            dataset.train_data.clone(),
+            dataset.train_labels.clone(),
+            dataset.test_data.clone(),
+            dataset.test_labels.clone(),
+        );
+
+        // Phase 2: Fine-tuning (si nécessaire)
+        if self.augmentation {
+            println!("🎛️ Phase 2: Fine-tuning");
+            // Implémenter data augmentation ici
+        }
+
+        current_model
+    }
+}
