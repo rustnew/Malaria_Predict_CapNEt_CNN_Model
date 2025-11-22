@@ -13,12 +13,12 @@ fn main() {
 
     // Configuration du réseau
     let network_config = NetworkConfig {
-        input_shape: (3, 64, 64),
+        input_shape: (3, 32, 32),
         layers: vec![
             // Couche convolutive 1
             LayerConfig::Conv2d {
                 in_channels: 3,
-                out_channels: 64,
+                out_channels: 32,
                 kernel_size: 3,
                 stride: 1,
                 padding: 1,
@@ -27,8 +27,8 @@ fn main() {
             
             // Couche convolutive 2
             LayerConfig::Conv2d {
-                in_channels: 64,
-                out_channels: 128,
+                in_channels: 32,
+                out_channels: 64,
                 kernel_size: 3,
                 stride: 2,
                 padding: 1,
@@ -37,7 +37,7 @@ fn main() {
             
             // Capsules primaires
             LayerConfig::PrimaryCapsules {
-                in_channels: 128,
+                in_channels: 64,
                 capsule_config: CapsuleConfig {
                     num_capsules: 32,
                     capsule_dim: 8,
@@ -99,10 +99,10 @@ fn main() {
     // Chargement des données
     println!("📁 Chargement des données...");
     let data_path = "malaria_data";
-    let loader = MalariaDataLoader::new(data_path, (64, 64));
+    let loader = MalariaDataLoader::new(data_path, (32, 32));
     
     // Charger un petit échantillon pour le test
-    let dataset = loader.load_dataset_fast(0.2, 1000);
+    let dataset = loader.load_dataset_fast(0.2, 500);
     
     println!("✅ Données chargées:");
     println!("   Train: {} échantillons", dataset.train_data.dim().0);
@@ -124,4 +124,5 @@ fn main() {
     println!("\n💾 Sauvegarde du modèle...");
     // trained_model.save("models/capsnet_malaria.bin");
     println!("✅ Modèle sauvegardé");
+
 }
